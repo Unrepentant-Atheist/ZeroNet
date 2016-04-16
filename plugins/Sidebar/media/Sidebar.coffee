@@ -107,13 +107,19 @@ class Sidebar extends Class
 			@setSiteInfo(site_info)
 			@original_set_site_info.apply(wrapper, arguments)
 
-	setSiteInfo: (site_info) ->
-		@updateHtmlTag()
-		@displayGlobe()
+		# Preload world.jpg
+		img = new Image();
+		img.src = "/uimedia/globe/world.jpg";
 
+	setSiteInfo: (site_info) ->
+		RateLimit 3000, =>
+			@updateHtmlTag()
+		RateLimit 30000, =>
+			@displayGlobe()
 
 	# Create the sidebar html tag
 	createHtmltag: ->
+		@when_loaded = $.Deferred()
 		if not @container
 			@container = $("""
 			<div class="sidebar-container"><div class="sidebar scrollable"><div class="content-wrapper"><div class="content">
@@ -131,12 +137,13 @@ class Sidebar extends Class
 				@log "Creating content"
 				morphdom(@tag.find(".content")[0], '<div class="content">'+res+'</div>')
 				# @scrollable()
+				@when_loaded.resolve()
 
 			else  # Not first update, patch the html to keep unchanged dom elements
 				@log "Patching content"
 				morphdom @tag.find(".content")[0], '<div class="content">'+res+'</div>', {
 					onBeforeMorphEl: (from_el, to_el) ->  # Ignore globe loaded state
-						if from_el.className == "globe"
+						if from_el.className == "globe" or from_el.className.indexOf("noupdate") >= 0
 							return false
 						else
 							return true
@@ -195,7 +202,8 @@ class Sidebar extends Class
 				# Opened
 				targetx = @width
 				if not @opened
-					@onOpened()
+					@when_loaded.done =>
+						@onOpened()
 				@opened = true
 
 			# Revent sidebar transitions
@@ -225,31 +233,59 @@ class Sidebar extends Class
 			), 300
 
 		# Site limit button
-		@tag.find("#button-sitelimit").on "click", =>
+		@tag.find("#button-sitelimit").off("click").on "click", =>
 			wrapper.ws.cmd "siteSetLimit", $("#input-sitelimit").val(), =>
 				wrapper.notifications.add "done-sitelimit", "done", "Site storage limit modified!", 5000
 				@updateHtmlTag()
 			return false
 
+		# Update site
+		@tag.find("#button-update").off("click").on "click", =>
+			@tag.find("#button-update").addClass("loading")
+			wrapper.ws.cmd "siteUpdate", wrapper.site_info.address, =>
+				wrapper.notifications.add "done-updated", "done", "Site updated!", 5000
+				@tag.find("#button-update").removeClass("loading")
+			return false
+
+		# Pause site
+		@tag.find("#button-pause").off("click").on "click", =>
+			@tag.find("#button-pause").addClass("hidden")
+			wrapper.ws.cmd "sitePause", wrapper.site_info.address
+			return false
+
+		# Resume site
+		@tag.find("#button-resume").off("click").on "click", =>
+			@tag.find("#button-resume").addClass("hidden")
+			wrapper.ws.cmd "siteResume", wrapper.site_info.address
+			return false
+
+		# Delete site
+		@tag.find("#button-delete").off("click").on "click", =>
+			wrapper.displayConfirm "Are you sure?", "Delete this site", =>
+				@tag.find("#button-delete").addClass("loading")
+				wrapper.ws.cmd "siteDelete", wrapper.site_info.address, ->
+					document.location = $(".fixbutton-bg").attr("href")
+			return false
+
 		# Owned checkbox
-		@tag.find("#checkbox-owned").on "click", =>
+		@tag.find("#checkbox-owned").off("click").on "click", =>
 			wrapper.ws.cmd "siteSetOwned", [@tag.find("#checkbox-owned").is(":checked")]
 
 		# Owned checkbox
-		@tag.find("#checkbox-autodownloadoptional").on "click", =>
+		@tag.find("#checkbox-autodownloadoptional").off("click").on "click", =>
 			wrapper.ws.cmd "siteSetAutodownloadoptional", [@tag.find("#checkbox-autodownloadoptional").is(":checked")]
 
 		# Change identity button
-		@tag.find("#button-identity").on "click", =>
+		@tag.find("#button-identity").off("click").on "click", =>
 			wrapper.ws.cmd "certSelect"
 			return false
 
 		# Owned checkbox
-		@tag.find("#checkbox-owned").on "click", =>
+		@tag.find("#checkbox-owned").off("click").on "click", =>
 			wrapper.ws.cmd "siteSetOwned", [@tag.find("#checkbox-owned").is(":checked")]
 
 		# Save settings
-		@tag.find("#button-settings").on "click", =>
+		@tag.find("#button-settings").off("click").on "click", =>
 			wrapper.ws.cmd "fileGet", "content.json", (res) =>
 				data = JSON.parse(res)
 				data["title"] = $("#settings-title").val()
@@ -264,8 +300,8 @@ class Sidebar extends Class
 			return false
 
 		# Sign content.json
-		@tag.find("#button-sign").on "click", =>
-			inner_path = @tag.find("#select-contents").val()
+		@tag.find("#button-sign").off("click").on "click", =>
+			inner_path = @tag.find("#input-contents").val()
 
 			if wrapper.site_info.privatekey
 				# Privatekey stored in users.json
@@ -282,8 +318,8 @@ class Sidebar extends Class
 			return false
 
 		# Publish content.json
-		@tag.find("#button-publish").on "click", =>
-			inner_path = @tag.find("#select-contents").val()
+		@tag.find("#button-publish").off("click").on "click", =>
+			inner_path = @tag.find("#input-contents").val()
 			@tag.find("#button-publish").addClass "loading"
 			wrapper.ws.cmd "sitePublish", {"inner_path": inner_path, "sign": false}, =>
 				@tag.find("#button-publish").removeClass "loading"
@@ -304,6 +340,7 @@ class Sidebar extends Class
 
 
 	loadGlobe: =>
+		console.log "loadGlobe", @tag.find(".globe").hasClass("loading")
 		if @tag.find(".globe").hasClass("loading")
 			setTimeout (=>
 				if typeof(DAT) == "undefined"  # Globe script not loaded, do it first
@@ -314,21 +351,25 @@ class Sidebar extends Class
 
 
 	displayGlobe: =>
-		wrapper.ws.cmd "sidebarGetPeers", [], (globe_data) =>
-			if @globe
-				@globe.scene.remove(@globe.points)
-				@globe.addData( globe_data, {format: 'magnitude', name: "hello", animated: false} )
-				@globe.createPoints()
-			else
-				try
-					@globe = new DAT.Globe( @tag.find(".globe")[0], {"imgDir": "/uimedia/globe/"} )
-					@globe.addData( globe_data, {format: 'magnitude', name: "hello"} )
+		img = new Image();
+		img.src = "/uimedia/globe/world.jpg";
+		img.onload = =>
+			wrapper.ws.cmd "sidebarGetPeers", [], (globe_data) =>
+				if @globe
+					@globe.scene.remove(@globe.points)
+					@globe.addData( globe_data, {format: 'magnitude', name: "hello", animated: false} )
 					@globe.createPoints()
-					@globe.animate()
-				catch e
-					@tag.find(".globe").addClass("error").text("WebGL not supported")
+				else
+					try
+						@globe = new DAT.Globe( @tag.find(".globe")[0], {"imgDir": "/uimedia/globe/"} )
+						@globe.addData( globe_data, {format: 'magnitude', name: "hello"} )
+						@globe.createPoints()
+						@globe.animate()
+					catch e
+						console.log "WebGL error", e
+						@tag.find(".globe").addClass("error").text("WebGL not supported")
 
-			@tag.find(".globe").removeClass("loading")
+				@tag.find(".globe").removeClass("loading")
 
 
 	unloadGlobe: =>

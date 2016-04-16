@@ -23,7 +23,7 @@ class Wrapper
 		@wrapperWsInited = false # Wrapper notified on websocket open
 		@site_error = null # Latest failed file download
 		@address = null
-		@opener = null
+		@opener_tested = false
 
 		window.onload = @onLoad # On iframe loaded
 		window.onhashchange = (e) => # On hash change
@@ -50,11 +50,14 @@ class Wrapper
 		else if cmd == "notification" # Display notification
 			type = message.params[0]
 			id = "notification-#{message.id}"
-			if "-" in message.params[0]  # - in first param: message id definied
+			if "-" in message.params[0]  # - in first param: message id defined
 				[id, type] = message.params[0].split("-")
 			@notifications.add(id, type, message.params[1], message.params[2])
 		else if cmd == "prompt" # Prompt input
 			@displayPrompt message.params[0], message.params[1], message.params[2], (res) =>
+				@ws.response message.id, res
+		else if cmd == "confirm" # Confirm action
+			@displayConfirm message.params[0], message.params[1], (res) =>
 				@ws.response message.id, res
 		else if cmd == "setSiteInfo"
 			@sendInner message # Pass to inner frame
@@ -70,20 +73,27 @@ class Wrapper
 
 	# Incoming message from inner frame
 	onMessageInner: (e) =>
-		if not window.postmessage_nonce_security and @opener == null  # Test opener
-			if window.opener
+		# No nonce security enabled, test if window opener present
+		if not window.postmessage_nonce_security and @opener_tested == false
+			if window.opener and window.opener != window
 				@log "Opener present", window.opener
 				@displayOpenerDialog()
 				return false
 			else
-				@opener = false
+				@opener_tested = true
 
 		message = e.data
+		# Invalid message (probably not for us)
+		if not message.cmd
+			return false
+
+		# Test nonce security to avoid third-party messages
 		if window.postmessage_nonce_security and message.wrapper_nonce != window.wrapper_nonce
 			@log "Message nonce error:", message.wrapper_nonce, '!=', window.wrapper_nonce
 			@actionNotification({"params": ["error", "Message wrapper_nonce error, please report!"]})
 			window.removeEventListener("message", @onMessageInner)
 			return
+
 		cmd = message.cmd
 		if cmd == "innerReady"
 			@inner_ready = true
@@ -116,6 +126,8 @@ class Wrapper
 			window.history.replaceState(message.params[0], message.params[1], query)
 		else if cmd == "wrapperGetState"
 			@sendInner {"cmd": "response", "to": message.id, "result": window.history.state}
+		else if cmd == "wrapperOpenWindow"
+			@actionOpenWindow(message.params)
 		else # Send to websocket
 			if message.id < 1000000
 				@ws.send(message) # Pass message to websocket
@@ -143,6 +155,17 @@ class Wrapper
 
 	# - Actions -
 
+	actionOpenWindow: (params) ->
+		if typeof(params) == "string"
+			w = window.open()
+			w.opener = null
+			w.location = params
+		else
+			w = window.open(null, params[1], params[2])
+			w.opener = null
+			w.location = params[0]
+
+
 	actionNotification: (message) ->
 		message.params = @toHtmlSafe(message.params) # Escape html
 		body =  $("<span class='message'>"+message.params[1]+"</span>")
@@ -153,7 +176,9 @@ class Wrapper
 	displayConfirm: (message, caption, cb) ->
 		body = $("<span class='message'>"+message+"</span>")
 		button = $("<a href='##{caption}' class='button button-#{caption}'>#{caption}</a>") # Add confirm button
-		button.on "click", cb
+		button.on "click", =>
+			cb(true)
+			return false
 		body.append(button)
 		@notifications.add("notification-#{caption}", "ask", body)
 

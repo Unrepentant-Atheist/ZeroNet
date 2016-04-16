@@ -1,10 +1,11 @@
 from Plugin import PluginManager
-import re
+import re, time
 
 @PluginManager.registerTo("UiWebsocket")
 class UiWebsocketPlugin(object):
     def actionFeedFollow(self, to, feeds):
         self.user.setFeedFollow(self.site.address, feeds)
+        self.user.save()
         self.response(to, "ok")
 
     def actionFeedListFollow(self, to):
@@ -35,6 +36,8 @@ class UiWebsocketPlugin(object):
                     continue
                 for row in res:
                     row = dict(row)
+                    if row["date_added"] > time.time() + 120:
+                        continue  # Feed item is in the future, skip it
                     row["site"] = address
                     row["feed_name"] = name
                     rows.append(row)

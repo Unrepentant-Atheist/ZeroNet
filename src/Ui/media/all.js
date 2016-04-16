@@ -781,7 +781,7 @@ jQuery.extend( jQuery.easing,
       this.wrapperWsInited = false;
       this.site_error = null;
       this.address = null;
-      this.opener = null;
+      this.opener_tested = false;
       window.onload = this.onLoad;
       window.onhashchange = (function(_this) {
         return function(e) {
@@ -830,6 +830,12 @@ jQuery.extend( jQuery.easing,
             return _this.ws.response(message.id, res);
           };
         })(this));
+      } else if (cmd === "confirm") {
+        return this.displayConfirm(message.params[0], message.params[1], (function(_this) {
+          return function(res) {
+            return _this.ws.response(message.id, res);
+          };
+        })(this));
       } else if (cmd === "setSiteInfo") {
         this.sendInner(message);
         if (message.params.address === this.address) {
@@ -847,16 +853,19 @@ jQuery.extend( jQuery.easing,
 
     Wrapper.prototype.onMessageInner = function(e) {
       var cmd, message, query;
-      if (!window.postmessage_nonce_security && this.opener === null) {
-        if (window.opener) {
+      if (!window.postmessage_nonce_security && this.opener_tested === false) {
+        if (window.opener && window.opener !== window) {
           this.log("Opener present", window.opener);
           this.displayOpenerDialog();
           return false;
         } else {
-          this.opener = false;
+          this.opener_tested = true;
         }
       }
       message = e.data;
+      if (!message.cmd) {
+        return false;
+      }
       if (window.postmessage_nonce_security && message.wrapper_nonce !== window.wrapper_nonce) {
         this.log("Message nonce error:", message.wrapper_nonce, '!=', window.wrapper_nonce);
         this.actionNotification({
@@ -905,6 +914,8 @@ jQuery.extend( jQuery.easing,
           "to": message.id,
           "result": window.history.state
         });
+      } else if (cmd === "wrapperOpenWindow") {
+        return this.actionOpenWindow(message.params);
       } else {
         if (message.id < 1000000) {
           return this.ws.send(message);
@@ -943,6 +954,19 @@ jQuery.extend( jQuery.easing,
       return $("body").prepend(elem);
     };
 
+    Wrapper.prototype.actionOpenWindow = function(params) {
+      var w;
+      if (typeof params === "string") {
+        w = window.open();
+        w.opener = null;
+        return w.location = params;
+      } else {
+        w = window.open(null, params[1], params[2]);
+        w.opener = null;
+        return w.location = params[0];
+      }
+    };
+
     Wrapper.prototype.actionNotification = function(message) {
       var body;
       message.params = this.toHtmlSafe(message.params);
@@ -954,7 +978,12 @@ jQuery.extend( jQuery.easing,
       var body, button;
       body = $("<span class='message'>" + message + "</span>");
       button = $("<a href='#" + caption + "' class='button button-" + caption + "'>" + caption + "</a>");
-      button.on("click", cb);
+      button.on("click", (function(_this) {
+        return function() {
+          cb(true);
+          return false;
+        };
+      })(this));
       body.append(button);
       this.notifications.add("notification-" + caption, "ask", body);
       button.focus();

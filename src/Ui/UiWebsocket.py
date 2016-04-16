@@ -3,7 +3,7 @@ import time
 import sys
 import hashlib
 import os
-import re
+import shutil
 
 import gevent
 
@@ -124,7 +124,7 @@ class UiWebsocket(object):
     def send(self, message, cb=None):
         message["id"] = self.next_message_id  # Add message id to allow response
         self.next_message_id += 1
-        if cb:  # Callback after client responsed
+        if cb:  # Callback after client responded
             self.waiting_cb[message["id"]] = cb
         if self.sending:
             return  # Already sending
@@ -169,7 +169,7 @@ class UiWebsocket(object):
                 self.response(req["id"], {"error": "Unknown command: %s" % cmd})
                 return
 
-        # Support calling as named, unnamed paramters and raw first argument too
+        # Support calling as named, unnamed parameters and raw first argument too
         if type(params) is dict:
             func(req["id"], **params)
         elif type(params) is list:
@@ -254,7 +254,7 @@ class UiWebsocket(object):
     def actionSiteInfo(self, to, file_status=None):
         ret = self.formatSiteInfo(self.site)
         if file_status:  # Client queries file status
-            if self.site.storage.isFile(file_status):  # File exits, add event done
+            if self.site.storage.isFile(file_status):  # File exist, add event done
                 ret["event"] = ("file_done", file_status)
         self.response(to, ret)
 
@@ -270,6 +270,7 @@ class UiWebsocket(object):
 
     # Sign content.json
     def actionSiteSign(self, to, privatekey=None, inner_path="content.json", response_ok=True):
+        self.log.debug("Signing: %s" % inner_path)
         site = self.site
         extend = {}  # Extended info for signing
         if not inner_path.endswith("content.json"):  # Find the content.json first
@@ -292,14 +293,14 @@ class UiWebsocket(object):
             privatekey = self.user.getAuthPrivatekey(self.site.address)
 
         # Signing
-        site.content_manager.loadContent(add_bad_files=False, force=True)  # Reload content.json, ignore errors to make it up-to-date
+        site.content_manager.loadContent(inner_path, add_bad_files=False, force=True)  # Reload content.json, ignore errors to make it up-to-date
         signed = site.content_manager.sign(inner_path, privatekey, extend=extend)  # Sign using private key sent by user
         if not signed:
             self.cmd("notification", ["error", "Content sign failed: invalid private key."])
             self.response(to, {"error": "Site sign failed"})
             return
 
-        site.content_manager.loadContent(add_bad_files=False)  # Load new content.json, ignore errors
+        site.content_manager.loadContent(inner_path, add_bad_files=False)  # Load new content.json, ignore errors
         if response_ok:
             self.response(to, "ok")
 
@@ -318,25 +319,42 @@ class UiWebsocket(object):
             self.site.announce()
 
         event_name = "publish %s %s" % (self.site.address, inner_path)
-        thread = RateLimit.callAsync(event_name, 7, self.site.publish, 5, inner_path)  # Only publish once in 7 second to 5 peers
+        called_instantly = RateLimit.isAllowed(event_name, 30)
+        thread = RateLimit.callAsync(event_name, 30, self.doSitePublish, inner_path)  # Only publish once in 30 seconds
         notification = "linked" not in dir(thread)  # Only display notification on first callback
         thread.linked = True
-        thread.link(lambda thread: self.cbSitePublish(to, thread, notification))  # At the end callback with request id and thread
+        if called_instantly:  # Allowed to call instantly
+            # At the end callback with request id and thread
+            thread.link(lambda thread: self.cbSitePublish(to, thread, notification, callback=notification))
+        else:
+            self.cmd(
+                "notification",
+                ["info", "Content publish queued for %.0f seconds." % RateLimit.delayLeft(event_name, 30), 5000]
+            )
+            self.response(to, "ok")
+            # At the end display notification
+            thread.link(lambda thread: self.cbSitePublish(to, thread, notification, callback=False))
+
+    def doSitePublish(self, inner_path):
+        diffs = self.site.content_manager.getDiffs(inner_path)
+        return self.site.publish(limit=5, inner_path=inner_path, diffs=diffs)
 
     # Callback of site publish
-    def cbSitePublish(self, to, thread, notification=True):
+    def cbSitePublish(self, to, thread, notification=True, callback=True):
         site = self.site
         published = thread.value
-        if published > 0:  # Successfuly published
+        if published > 0:  # Successfully published
             if notification:
                 self.cmd("notification", ["done", "Content published to %s peers." % published, 5000])
-                self.response(to, "ok")
                 site.updateWebsocket()  # Send updated site data to local websocket clients
+            if callback:
+                self.response(to, "ok")
         else:
             if len(site.peers) == 0:
                 if sys.modules["main"].file_server.port_opened or sys.modules["main"].file_server.tor_manager.start_onions:
                     if notification:
                         self.cmd("notification", ["info", "No peers found, but your content is ready to access.", 5000])
+                    if callback:
                         self.response(to, "ok")
                 else:
                     if notification:
@@ -345,6 +363,7 @@ class UiWebsocket(object):
                             """Your network connection is restricted. Please, open <b>%s</b> port <br>
                             on your router to make your site accessible for everyone.""" % config.fileserver_port
                         ])
+                    if callback:
                         self.response(to, {"error": "Port not opened."})
 
             else:
@@ -363,9 +382,19 @@ class UiWebsocket(object):
         try:
             import base64
             content = base64.b64decode(content_base64)
+            # Save old file to generate patch later
+            if inner_path.endswith(".json") and self.site.storage.isFile(inner_path) and not self.site.storage.isFile(inner_path + "-old"):
+                try:
+                    self.site.storage.rename(inner_path, inner_path + "-old")
+                except Exception:
+                    # Rename failed, fall back to standard file write
+                    f_old = self.site.storage.open(inner_path, "rb")
+                    f_new = self.site.storage.open(inner_path + "-old", "wb")
+                    shutil.copyfileobj(f_old, f_new)
+
             self.site.storage.write(inner_path, content)
         except Exception, err:
-            return self.response(to, {"error": "Write error: %s" % err})
+            return self.response(to, {"error": "Write error: %s" % Debug.formatException(err)})
 
         if inner_path.endswith("content.json"):
             self.site.content_manager.loadContent(inner_path, add_bad_files=False, force=True)
@@ -448,10 +477,26 @@ class UiWebsocket(object):
                     ["done", "New certificate added: <b>%s/%s@%s</b>." % (auth_type, auth_user_name, domain)]
                 )
                 self.response(to, "ok")
+            elif res is False:
+                # Display confirmation of change
+                cert_current = self.user.certs[domain]
+                body = "You current certificate: <b>%s/%s@%s</b>" % (cert_current["auth_type"], cert_current["auth_user_name"], domain)
+                self.cmd("confirm", [body, "Change it to %s/%s@%s" % (auth_type, auth_user_name, domain)],
+                    lambda (res): self.cbCertAddConfirm(to, domain, auth_type, auth_user_name, cert)
+                )
             else:
                 self.response(to, "Not changed")
         except Exception, err:
             self.response(to, {"error": err.message})
+
+    def cbCertAddConfirm(self, to, domain, auth_type, auth_user_name, cert):
+        self.user.deleteCert(domain)
+        self.user.addCert(self.user.getAuthAddress(self.site.address), domain, auth_type, auth_user_name, cert)
+        self.cmd(
+            "notification",
+            ["done", "Certificate changed to: <b>%s/%s@%s</b>." % (auth_type, auth_user_name, domain)]
+        )
+        self.response(to, "ok")
 
     # Select certificate for site
     def actionCertSelect(self, to, accepted_domains=[]):
@@ -480,8 +525,8 @@ class UiWebsocket(object):
             else:
                 title = "<b>%s</b>" % account
             body += "<a href='#Select+account' class='select select-close cert %s' title='%s'>%s</a>" % (css_class, domain, title)
-        # More avalible  providers
-        more_domains = [domain for domain in accepted_domains if domain not in self.user.certs]  # Domainains we not displayed yet
+        # More available  providers
+        more_domains = [domain for domain in accepted_domains if domain not in self.user.certs]  # Domains we not displayed yet
         if more_domains:
             # body+= "<small style='margin-top: 10px; display: block'>Accepted authorization providers by the site:</small>"
             body += "<div style='background-color: #F7F7F7; margin-right: -30px'>"
@@ -506,12 +551,12 @@ class UiWebsocket(object):
         # Send the notification
         self.cmd("notification", ["ask", body])
 
+    # - Admin actions -
+
     # Set certificate that used for authenticate user for site
     def actionCertSet(self, to, domain):
         self.user.setCert(self.site.address, domain)
         self.site.updateWebsocket(cert_changed=domain)
-
-    # - Admin actions -
 
     # List all site info
     def actionSiteList(self, to):
@@ -534,9 +579,13 @@ class UiWebsocket(object):
 
     # Update site content.json
     def actionSiteUpdate(self, to, address):
+        def updateThread():
+            site.update()
+            self.response(to, "Updated")
+
         site = self.server.sites.get(address)
         if site and (site.address == self.site.address or "ADMIN" in self.site.settings["permissions"]):
-            gevent.spawn(site.update)
+            gevent.spawn(updateThread)
         else:
             self.response(to, {"error": "Unknown site: %s" % address})
 
@@ -548,6 +597,7 @@ class UiWebsocket(object):
             site.saveSettings()
             site.updateWebsocket()
             site.worker_manager.stopWorkers()
+            self.response(to, "Paused")
         else:
             self.response(to, {"error": "Unknown site: %s" % address})
 
@@ -560,6 +610,7 @@ class UiWebsocket(object):
             gevent.spawn(site.update, announce=True)
             time.sleep(0.001)  # Wait for update thread starting
             site.updateWebsocket()
+            self.response(to, "Resumed")
         else:
             self.response(to, {"error": "Unknown site: %s" % address})
 
@@ -574,6 +625,7 @@ class UiWebsocket(object):
             site.updateWebsocket()
             SiteManager.site_manager.delete(address)
             self.user.deleteSiteData(address)
+            self.response(to, "Deleted")
         else:
             self.response(to, {"error": "Unknown site: %s" % address})
 
@@ -628,11 +680,11 @@ class UiWebsocket(object):
         for line in lines:
             if line.strip() == "[global]":
                 global_line_i = i
-            if line.startswith(key+" = "):
+            if line.startswith(key + " = "):
                 key_line_i = i
             i += 1
 
-        if value == None:  # Delete line
+        if value is None:  # Delete line
             if key_line_i:
                 del lines[key_line_i]
         else:  # Add / update
@@ -643,7 +695,7 @@ class UiWebsocket(object):
                 lines.append("[global]")
                 lines.append(new_line)
             else:  # Has global section, append the line after it
-                lines.insert(global_line_i+1, new_line)
+                lines.insert(global_line_i + 1, new_line)
 
         open(config.config_file, "w").write("\n".join(lines))
         self.response(to, "ok")

@@ -4,6 +4,7 @@ import cgi
 import sys
 import math
 import time
+import json
 try:
     import cStringIO as StringIO
 except:
@@ -65,14 +66,16 @@ class UiWebsocketPlugin(object):
         if peers_total:
             percent_connected = float(connected) / peers_total
             percent_connectable = float(connectable) / peers_total
+            percent_onion = float(onion) / peers_total
         else:
-            percent_connectable = percent_connected = 0
+            percent_connectable = percent_connected = percent_onion = 0
         body.append("""
             <li>
              <label>Peers</label>
              <ul class='graph'>
               <li style='width: 100%' class='total back-black' title="Total peers"></li>
               <li style='width: {percent_connectable:.0%}' class='connectable back-blue' title='Connectable peers'></li>
+              <li style='width: {percent_onion:.0%}' class='connected back-purple' title='Onion'></li>
               <li style='width: {percent_connected:.0%}' class='connected back-green' title='Connected peers'></li>
              </ul>
              <ul class='graph-legend'>
@@ -148,8 +151,11 @@ class UiWebsocketPlugin(object):
                 percent = 0
             else:
                 percent = 100 * (float(size) / size_total)
-            percent = math.floor(percent*100)/100  # Floor to 2 digits
-            body.append(u"""<li style='width: %.2f%%' class='%s back-%s' title="%s"></li>""" % (percent, extension, color, extension))
+            percent = math.floor(percent * 100) / 100  # Floor to 2 digits
+            body.append(
+                u"""<li style='width: %.2f%%' class='%s back-%s' title="%s"></li>""" %
+                (percent, extension, color, extension)
+            )
 
         # Legend
         body.append("</ul><ul class='graph-legend'>")
@@ -261,8 +267,16 @@ class UiWebsocketPlugin(object):
              <ul class='filelist'>
         """)
 
-        for bad_file in site.bad_files.keys():
-            body.append("""<li class='color-red' title="%s">%s</li>""" % (cgi.escape(bad_file, True), cgi.escape(bad_file, True)))
+        i = 0
+        for bad_file, tries in site.bad_files.iteritems():
+            i += 1
+            body.append("""<li class='color-red' title="%s (%s tries)">%s</li>""" % (cgi.escape(bad_file, True), tries, cgi.escape(bad_file, True)))
+            if i > 30:
+                break
+
+        if len(site.bad_files) > 30:
+            body.append("""<li class='color-red'>+ %s more</li>""" % (len(site.bad_files)-30))
+
 
         body.append("""
              </ul>
@@ -285,11 +299,48 @@ class UiWebsocketPlugin(object):
 
     def sidebarRenderIdentity(self, body, site):
         auth_address = self.user.getAuthAddress(self.site.address)
+        rules = self.site.content_manager.getRules("data/users/%s/content.json" % auth_address)
+        if rules and rules.get("max_size"):
+            quota = rules["max_size"] / 1024
+            content = site.content_manager.contents["data/users/%s/content.json" % auth_address]
+            used = len(json.dumps(content)) + sum([file["size"] for file in content["files"].values()])
+            used = used / 1024
+        else:
+            quota = used = 0
+
         body.append("""
             <li>
-             <label>Identity address</label>
+             <label>Identity address <small>(limit used: {used:.2f}kB / {quota:.2f}kB)</small></label>
              <span class='input text disabled'>{auth_address}</span>
              <a href='#Change' class='button' id='button-identity'>Change</a>
+            </li>
+        """.format(**locals()))
+
+    def sidebarRenderControls(self, body, site):
+        auth_address = self.user.getAuthAddress(self.site.address)
+        if self.site.settings["serving"]:
+            class_pause = ""
+            class_resume = "hidden"
+        else:
+            class_pause = "hidden"
+            class_resume = ""
+
+        body.append("""
+            <li>
+             <label>Site control</label>
+             <a href='#Update' class='button noupdate' id='button-update'>Update</a>
+             <a href='#Pause' class='button {class_pause}' id='button-pause'>Pause</a>
+             <a href='#Resume' class='button {class_resume}' id='button-resume'>Resume</a>
+             <a href='#Delete' class='button noupdate' id='button-delete'>Delete</a>
+            </li>
+        """.format(**locals()))
+
+        site_address = self.site.address
+        body.append("""
+            <li>
+             <label>Site address</label><br>
+             <span class='input text disabled'>{site_address}</span>
+             <a href='bitcoin:{site_address}' class='button' id='button-donate'>Donate</a>
             </li>
         """.format(**locals()))
 
@@ -334,15 +385,7 @@ class UiWebsocketPlugin(object):
         body.append("""
             <li>
              <label>Content publishing</label>
-             <select id='select-contents'>
-        """)
-
-        for inner_path in sorted(site.content_manager.contents.keys()):
-            body.append(u"<option>%s</option>" % cgi.escape(inner_path, True))
-
-        body.append("""
-             </select>
-             <span class='select-down'>&rsaquo;</span>
+             <input type='text' class='text' value="content.json" id='input-contents' style='width: 201px'/>
              <a href='#Sign' class='button' id='button-sign'>Sign</a>
              <a href='#Publish' class='button' id='button-publish'>Publish</a>
             </li>
@@ -367,10 +410,11 @@ class UiWebsocketPlugin(object):
         has_optional = self.sidebarRenderOptionalFileStats(body, site)
         if has_optional:
             self.sidebarRenderOptionalFileSettings(body, site)
-        if site.bad_files:
-            self.sidebarRenderBadFiles(body, site)
         self.sidebarRenderDbOptions(body, site)
         self.sidebarRenderIdentity(body, site)
+        self.sidebarRenderControls(body, site)
+        if site.bad_files:
+            self.sidebarRenderBadFiles(body, site)
 
         self.sidebarRenderOwnedCheckbox(body, site)
         body.append("<div class='settings-owned'>")
@@ -391,7 +435,7 @@ class UiWebsocketPlugin(object):
         self.log.info("Downloading GeoLite2 City database...")
         self.cmd("notification", ["geolite-info", "Downloading GeoLite2 City database (one time only, ~15MB)...", 0])
         db_urls = [
-            "http://geolite.maxmind.com/download/geoip/database/GeoLite2-City.mmdb.gz",
+            "https://geolite.maxmind.com/download/geoip/database/GeoLite2-City.mmdb.gz",
             "https://raw.githubusercontent.com/texnikru/GeoLite2-Database/master/GeoLite2-City.mmdb.gz"
         ]
         for db_url in db_urls:
@@ -492,12 +536,22 @@ class UiWebsocketPlugin(object):
 
     def actionSiteSetOwned(self, to, owned):
         permissions = self.getPermissions(to)
+
+        if "Multiuser" in PluginManager.plugin_manager.plugin_names:
+            self.cmd("notification", ["info", "This function is disabled on this proxy"])
+            return False
+
         if "ADMIN" not in permissions:
             return self.response(to, "You don't have permission to run this command")
         self.site.settings["own"] = bool(owned)
 
     def actionSiteSetAutodownloadoptional(self, to, owned):
         permissions = self.getPermissions(to)
+
+        if "Multiuser" in PluginManager.plugin_manager.plugin_names:
+            self.cmd("notification", ["info", "This function is disabled on this proxy"])
+            return False
+
         if "ADMIN" not in permissions:
             return self.response(to, "You don't have permission to run this command")
         self.site.settings["autodownloadoptional"] = bool(owned)

@@ -10,6 +10,7 @@ from Debug import Debug
 from Crypt import CryptHash
 from Config import config
 from util import helper
+from util import Diff
 from Peer import PeerHashfield
 
 
@@ -27,7 +28,7 @@ class ContentManager(object):
     # Load content.json to self.content
     # Return: Changed files ["index.html", "data/messages.json"], Deleted files ["old.jpg"]
     def loadContent(self, content_inner_path="content.json", add_bad_files=True, delete_removed_files=True, load_includes=True, force=False):
-        content_inner_path = content_inner_path.strip("/")  # Remove / from begning
+        content_inner_path = content_inner_path.strip("/")  # Remove / from beginning
         old_content = self.contents.get(content_inner_path)
         content_path = self.site.storage.getPath(content_inner_path)
         content_dir = helper.getDirname(self.site.storage.getPath(content_inner_path))
@@ -42,7 +43,7 @@ class ContentManager(object):
                             continue
                         match = re.search("([0-9\.]+),$", line.strip(" \r\n"))
                         if match and float(match.group(1)) <= old_content.get("modified", 0):
-                            self.log.debug("loadContent same json file, skipping")
+                            self.log.debug("%s loadContent same json file, skipping" % content_inner_path)
                             return [], []
 
                 new_content = json.load(open(content_path))
@@ -61,7 +62,7 @@ class ContentManager(object):
             for relative_path, info in new_content.get("files", {}).iteritems():
                 if "sha512" in info:
                     hash_type = "sha512"
-                else:  # Backward compatiblity
+                else:  # Backward compatibility
                     hash_type = "sha1"
 
                 new_hash = info[hash_type]
@@ -112,6 +113,20 @@ class ContentManager(object):
                         except Exception, err:
                             self.log.debug("Error deleting file %s: %s" % (file_inner_path, err))
 
+                    # Cleanup empty dirs
+                    tree = {root: [dirs, files] for root, dirs, files in os.walk(self.site.storage.getPath(content_inner_dir))}
+                    for root in sorted(tree, key=len, reverse=True):
+                        dirs, files = tree[root]
+                        if dirs == [] and files == []:
+                            root_inner_path = self.site.storage.getInnerPath(root.replace("\\", "/"))
+                            self.log.debug("Empty directory: %s, cleaning up." % root_inner_path)
+                            try:
+                                self.site.storage.deleteDir(root_inner_path)
+                                # Remove from tree dict to reflect changed state
+                                tree[os.path.dirname(root)][0].remove(os.path.basename(root))
+                            except Exception, err:
+                                self.log.debug("Error deleting empty directory %s: %s" % (root_inner_path, err))
+
             # Load includes
             if load_includes and "includes" in new_content:
                 for relative_path, info in new_content["includes"].items():
@@ -143,6 +158,10 @@ class ContentManager(object):
                     if include_deleted:
                         deleted += include_deleted  # Add changed files
 
+            # Save some memory
+            new_content["signs"] = None
+            if "cert_sign" in new_content:
+                new_content["cert_sign"] = None
             # Update the content
             self.contents[content_inner_path] = new_content
         except Exception, err:
@@ -167,7 +186,7 @@ class ContentManager(object):
         for inner_path, content in self.contents.iteritems():
             if inner_path == ignore:
                 continue
-            total_size += self.site.storage.getSize(inner_path)  # Size of content.json
+            total_size += len(json.dumps(inner_path))  # Size of content.json
             for file, info in content.get("files", {}).iteritems():
                 total_size += info["size"]
         return total_size
@@ -249,7 +268,7 @@ class ContentManager(object):
         try:
             if not content:
                 content = self.site.storage.loadJson(inner_path)  # Read the file if no content specified
-        except (Exception, ):  # Content.json not exist
+        except Exception:  # Content.json not exist
             return {"signers": [user_address], "user_address": user_address}  # Return information that we know for sure
 
         """if not "cert_user_name" in content: # New file, unknown user
@@ -260,7 +279,10 @@ class ContentManager(object):
 
         rules = copy.copy(user_contents["permissions"].get(content["cert_user_id"], {}))  # Default rules by username
         if rules is False:
-            return False  # User banned
+            banned = True
+            rules = {}
+        else:
+            banned = False
         if "signers" in rules:
             rules["signers"] = rules["signers"][:]  # Make copy of the signers
         for permission_pattern, permission_rules in user_contents["permission_rules"].items():  # Regexp rules
@@ -285,17 +307,46 @@ class ContentManager(object):
         rules["cert_signers"] = user_contents["cert_signers"]  # Add valid cert signers
         if "signers" not in rules:
             rules["signers"] = []
-        rules["signers"].append(user_address)  # Add user as valid signer
+
+        if not banned:
+            rules["signers"].append(user_address)  # Add user as valid signer
         rules["user_address"] = user_address
         rules["includes_allowed"] = False
 
         return rules
 
+    # Get diffs for changed files
+    def getDiffs(self, inner_path, limit=30*1024, update_files=True):
+        if not inner_path in self.contents:
+            return None
+        diffs = {}
+        content_inner_path_dir = helper.getDirname(inner_path)
+        for file_relative_path in self.contents[inner_path].get("files", {}):
+            file_inner_path = content_inner_path_dir + file_relative_path
+            if self.site.storage.isFile(file_inner_path+"-new"):  # New version present
+                diffs[file_relative_path] = Diff.diff(
+                    list(self.site.storage.open(file_inner_path)),
+                    list(self.site.storage.open(file_inner_path+"-new")),
+                    limit=limit
+                )
+                if update_files:
+                    self.site.storage.delete(file_inner_path)
+                    self.site.storage.rename(file_inner_path+"-new", file_inner_path)
+            if self.site.storage.isFile(file_inner_path+"-old"):  # Old version present
+                diffs[file_relative_path] = Diff.diff(
+                    list(self.site.storage.open(file_inner_path+"-old")),
+                    list(self.site.storage.open(file_inner_path)),
+                    limit=limit
+                )
+                if update_files:
+                    self.site.storage.delete(file_inner_path+"-old")
+        return diffs
+
     # Hash files in directory
     def hashFiles(self, dir_inner_path, ignore_pattern=None, optional_pattern=None):
         files_node = {}
         files_optional_node = {}
-        if not re.match("^[a-zA-Z0-9_\.\+-/]*$", dir_inner_path):
+        if not re.match("^[a-zA-Z0-9_@=\.\+-/]*$", dir_inner_path):
             ignored = True
             self.log.error("- [ERROR] Only ascii encoded directories allowed: %s" % dir_inner_path)
 
@@ -307,15 +358,15 @@ class ContentManager(object):
                 ignored = True
             elif ignore_pattern and re.match(ignore_pattern, file_relative_path):
                 ignored = True
-            elif file_name.startswith("."):
+            elif file_name.startswith(".") or file_name.endswith("-old") or file_name.endswith("-new"):
                 ignored = True
-            elif not re.match("^[a-zA-Z0-9_\.\+\-/]+$", file_relative_path):
+            elif not re.match("^[a-zA-Z0-9_@=\.\+\-/]+$", file_relative_path):
                 ignored = True
-                self.log.error("- [ERROR] Only ascii encodes filenames allowed: %s" % file_relative_path)
+                self.log.error("- [ERROR] Only ascii encoded filenames allowed: %s" % file_relative_path)
             elif optional_pattern and re.match(optional_pattern, file_relative_path):
                 optional = True
 
-            if ignored:  # Ignore content.json, definied regexp and files starting with .
+            if ignored:  # Ignore content.json, defined regexp and files starting with .
                 self.log.info("- [SKIPPED] %s" % file_relative_path)
             else:
                 file_path = self.site.storage.getPath(dir_inner_path + "/" + file_relative_path)
@@ -332,7 +383,13 @@ class ContentManager(object):
     # Create and sign a content.json
     # Return: The new content if filewrite = False
     def sign(self, inner_path="content.json", privatekey=None, filewrite=True, update_changed_files=False, extend=None):
-        content = self.contents.get(inner_path)
+        if inner_path in self.contents:
+            content = self.contents[inner_path]
+            if self.contents[inner_path].get("cert_sign", False) is None:
+                # Recover cert_sign from file
+                content["cert_sign"] = self.site.storage.loadJson(inner_path).get("cert_sign")
+        else:
+            content = None
         if not content:  # Content not exist yet, load default one
             self.log.info("File %s not exist yet, loading default values..." % inner_path)
             content = {"files": {}, "signs": {}}  # Default content.json
@@ -479,8 +536,15 @@ class ContentManager(object):
     # Return: True or False
     def verifyContent(self, inner_path, content):
         content_size = len(json.dumps(content)) + sum([file["size"] for file in content["files"].values()])  # Size of new content
+        # Calculate old content size
+        old_content = self.contents.get(inner_path)
+        if old_content:
+            old_content_size = len(json.dumps(old_content)) + sum([file["size"] for file in old_content["files"].values()])
+        else:
+            old_content_size = 0
+
         content_size_optional = sum([file["size"] for file in content.get("files_optional", {}).values()])
-        site_size = self.getTotalSize(ignore=inner_path) + content_size  # Site size without old content
+        site_size = self.site.settings["size"] - old_content_size + content_size  # Site size without old content plus the new
         if site_size > self.site.settings.get("size", 0):
             self.site.settings["size"] = site_size  # Save to settings if larger
 
@@ -563,7 +627,7 @@ class ContentManager(object):
                             "We have newer %s (Our: %s, Sent: %s)" %
                             (inner_path, old_content["modified"], new_content["modified"])
                         )
-                        gevent.spawn(self.site.publish, inner_path=inner_path)  # Try to fix the broken peers
+                        # gevent.spawn(self.site.publish, inner_path=inner_path)  # Try to fix the broken peers
                         return False
                 if new_content["modified"] > time.time() + 60 * 60 * 24:  # Content modified in the far future (allow 1 day+)
                     self.log.error("%s modify is in the future!" % inner_path)
@@ -601,7 +665,8 @@ class ContentManager(object):
                             valid_signs += CryptBitcoin.verify(sign_content, address, signs[address])
                         if valid_signs >= signs_required:
                             break  # Break if we has enough signs
-                    self.log.debug("%s: Valid signs: %s/%s" % (inner_path, valid_signs, signs_required))
+                    if config.verbose:
+                        self.log.debug("%s: Valid signs: %s/%s" % (inner_path, valid_signs, signs_required))
                     return valid_signs >= signs_required
                 else:  # Old style signing
                     return CryptBitcoin.verify(sign_content, self.site.address, sign)

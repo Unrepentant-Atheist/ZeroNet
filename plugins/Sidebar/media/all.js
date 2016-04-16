@@ -57,6 +57,35 @@
 }).call(this);
 
 
+/* ---- plugins/Sidebar/media/RateLimit.coffee ---- */
+
+
+(function() {
+  var call_after_interval, limits;
+
+  limits = {};
+
+  call_after_interval = {};
+
+  window.RateLimit = function(interval, fn) {
+    if (!limits[fn]) {
+      call_after_interval[fn] = false;
+      fn();
+      return limits[fn] = setTimeout((function() {
+        if (call_after_interval[fn]) {
+          fn();
+        }
+        delete limits[fn];
+        return delete call_after_interval[fn];
+      }), interval);
+    } else {
+      return call_after_interval[fn] = true;
+    }
+  };
+
+}).call(this);
+
+
 /* ---- plugins/Sidebar/media/Scrollable.js ---- */
 
 
@@ -265,6 +294,7 @@ window.initScrollable = function () {
     };
 
     Sidebar.prototype.moved = function() {
+      var img;
       this.log("Moved");
       this.createHtmltag();
       $(document.body).css("perspective", "1000px").addClass("body-sidebar");
@@ -277,20 +307,31 @@ window.initScrollable = function () {
         };
       })(this));
       $(window).trigger("resize");
-      return wrapper.setSiteInfo = (function(_this) {
+      wrapper.setSiteInfo = (function(_this) {
         return function(site_info) {
           _this.setSiteInfo(site_info);
           return _this.original_set_site_info.apply(wrapper, arguments);
         };
       })(this);
+      img = new Image();
+      return img.src = "/uimedia/globe/world.jpg";
     };
 
     Sidebar.prototype.setSiteInfo = function(site_info) {
-      this.updateHtmlTag();
-      return this.displayGlobe();
+      RateLimit(3000, (function(_this) {
+        return function() {
+          return _this.updateHtmlTag();
+        };
+      })(this));
+      return RateLimit(30000, (function(_this) {
+        return function() {
+          return _this.displayGlobe();
+        };
+      })(this));
     };
 
     Sidebar.prototype.createHtmltag = function() {
+      this.when_loaded = $.Deferred();
       if (!this.container) {
         this.container = $("<div class=\"sidebar-container\"><div class=\"sidebar scrollable\"><div class=\"content-wrapper\"><div class=\"content\">\n</div></div></div></div>");
         this.container.appendTo(document.body);
@@ -305,12 +346,13 @@ window.initScrollable = function () {
         return function(res) {
           if (_this.tag.find(".content").children().length === 0) {
             _this.log("Creating content");
-            return morphdom(_this.tag.find(".content")[0], '<div class="content">' + res + '</div>');
+            morphdom(_this.tag.find(".content")[0], '<div class="content">' + res + '</div>');
+            return _this.when_loaded.resolve();
           } else {
             _this.log("Patching content");
             return morphdom(_this.tag.find(".content")[0], '<div class="content">' + res + '</div>', {
               onBeforeMorphEl: function(from_el, to_el) {
-                if (from_el.className === "globe") {
+                if (from_el.className === "globe" || from_el.className.indexOf("noupdate") >= 0) {
                   return false;
                 } else {
                   return true;
@@ -371,7 +413,11 @@ window.initScrollable = function () {
         } else {
           targetx = this.width;
           if (!this.opened) {
-            this.onOpened();
+            this.when_loaded.done((function(_this) {
+              return function() {
+                return _this.onOpened();
+              };
+            })(this));
           }
           this.opened = true;
         }
@@ -404,7 +450,7 @@ window.initScrollable = function () {
           }), 300);
         };
       })(this));
-      this.tag.find("#button-sitelimit").on("click", (function(_this) {
+      this.tag.find("#button-sitelimit").off("click").on("click", (function(_this) {
         return function() {
           wrapper.ws.cmd("siteSetLimit", $("#input-sitelimit").val(), function() {
             wrapper.notifications.add("done-sitelimit", "done", "Site storage limit modified!", 5000);
@@ -413,28 +459,63 @@ window.initScrollable = function () {
           return false;
         };
       })(this));
-      this.tag.find("#checkbox-owned").on("click", (function(_this) {
+      this.tag.find("#button-update").off("click").on("click", (function(_this) {
+        return function() {
+          _this.tag.find("#button-update").addClass("loading");
+          wrapper.ws.cmd("siteUpdate", wrapper.site_info.address, function() {
+            wrapper.notifications.add("done-updated", "done", "Site updated!", 5000);
+            return _this.tag.find("#button-update").removeClass("loading");
+          });
+          return false;
+        };
+      })(this));
+      this.tag.find("#button-pause").off("click").on("click", (function(_this) {
+        return function() {
+          _this.tag.find("#button-pause").addClass("hidden");
+          wrapper.ws.cmd("sitePause", wrapper.site_info.address);
+          return false;
+        };
+      })(this));
+      this.tag.find("#button-resume").off("click").on("click", (function(_this) {
+        return function() {
+          _this.tag.find("#button-resume").addClass("hidden");
+          wrapper.ws.cmd("siteResume", wrapper.site_info.address);
+          return false;
+        };
+      })(this));
+      this.tag.find("#button-delete").off("click").on("click", (function(_this) {
+        return function() {
+          wrapper.displayConfirm("Are you sure?", "Delete this site", function() {
+            _this.tag.find("#button-delete").addClass("loading");
+            return wrapper.ws.cmd("siteDelete", wrapper.site_info.address, function() {
+              return document.location = $(".fixbutton-bg").attr("href");
+            });
+          });
+          return false;
+        };
+      })(this));
+      this.tag.find("#checkbox-owned").off("click").on("click", (function(_this) {
         return function() {
           return wrapper.ws.cmd("siteSetOwned", [_this.tag.find("#checkbox-owned").is(":checked")]);
         };
       })(this));
-      this.tag.find("#checkbox-autodownloadoptional").on("click", (function(_this) {
+      this.tag.find("#checkbox-autodownloadoptional").off("click").on("click", (function(_this) {
         return function() {
           return wrapper.ws.cmd("siteSetAutodownloadoptional", [_this.tag.find("#checkbox-autodownloadoptional").is(":checked")]);
         };
       })(this));
-      this.tag.find("#button-identity").on("click", (function(_this) {
+      this.tag.find("#button-identity").off("click").on("click", (function(_this) {
         return function() {
           wrapper.ws.cmd("certSelect");
           return false;
         };
       })(this));
-      this.tag.find("#checkbox-owned").on("click", (function(_this) {
+      this.tag.find("#checkbox-owned").off("click").on("click", (function(_this) {
         return function() {
           return wrapper.ws.cmd("siteSetOwned", [_this.tag.find("#checkbox-owned").is(":checked")]);
         };
       })(this));
-      this.tag.find("#button-settings").on("click", (function(_this) {
+      this.tag.find("#button-settings").off("click").on("click", (function(_this) {
         return function() {
           wrapper.ws.cmd("fileGet", "content.json", function(res) {
             var data, json_raw;
@@ -454,10 +535,10 @@ window.initScrollable = function () {
           return false;
         };
       })(this));
-      this.tag.find("#button-sign").on("click", (function(_this) {
+      this.tag.find("#button-sign").off("click").on("click", (function(_this) {
         return function() {
           var inner_path;
-          inner_path = _this.tag.find("#select-contents").val();
+          inner_path = _this.tag.find("#input-contents").val();
           if (wrapper.site_info.privatekey) {
             wrapper.ws.cmd("siteSign", ["stored", inner_path], function(res) {
               return wrapper.notifications.add("sign", "done", inner_path + " Signed!", 5000);
@@ -474,10 +555,10 @@ window.initScrollable = function () {
           return false;
         };
       })(this));
-      this.tag.find("#button-publish").on("click", (function(_this) {
+      this.tag.find("#button-publish").off("click").on("click", (function(_this) {
         return function() {
           var inner_path;
-          inner_path = _this.tag.find("#select-contents").val();
+          inner_path = _this.tag.find("#input-contents").val();
           _this.tag.find("#button-publish").addClass("loading");
           return wrapper.ws.cmd("sitePublish", {
             "inner_path": inner_path,
@@ -505,6 +586,7 @@ window.initScrollable = function () {
     };
 
     Sidebar.prototype.loadGlobe = function() {
+      console.log("loadGlobe", this.tag.find(".globe").hasClass("loading"));
       if (this.tag.find(".globe").hasClass("loading")) {
         return setTimeout(((function(_this) {
           return function() {
@@ -519,36 +601,42 @@ window.initScrollable = function () {
     };
 
     Sidebar.prototype.displayGlobe = function() {
-      return wrapper.ws.cmd("sidebarGetPeers", [], (function(_this) {
-        return function(globe_data) {
-          var e;
-          if (_this.globe) {
-            _this.globe.scene.remove(_this.globe.points);
-            _this.globe.addData(globe_data, {
-              format: 'magnitude',
-              name: "hello",
-              animated: false
-            });
-            _this.globe.createPoints();
-          } else {
-            try {
-              _this.globe = new DAT.Globe(_this.tag.find(".globe")[0], {
-                "imgDir": "/uimedia/globe/"
-              });
+      var img;
+      img = new Image();
+      img.src = "/uimedia/globe/world.jpg";
+      return img.onload = (function(_this) {
+        return function() {
+          return wrapper.ws.cmd("sidebarGetPeers", [], function(globe_data) {
+            var e;
+            if (_this.globe) {
+              _this.globe.scene.remove(_this.globe.points);
               _this.globe.addData(globe_data, {
                 format: 'magnitude',
-                name: "hello"
+                name: "hello",
+                animated: false
               });
               _this.globe.createPoints();
-              _this.globe.animate();
-            } catch (_error) {
-              e = _error;
-              _this.tag.find(".globe").addClass("error").text("WebGL not supported");
+            } else {
+              try {
+                _this.globe = new DAT.Globe(_this.tag.find(".globe")[0], {
+                  "imgDir": "/uimedia/globe/"
+                });
+                _this.globe.addData(globe_data, {
+                  format: 'magnitude',
+                  name: "hello"
+                });
+                _this.globe.createPoints();
+                _this.globe.animate();
+              } catch (_error) {
+                e = _error;
+                console.log("WebGL error", e);
+                _this.tag.find(".globe").addClass("error").text("WebGL not supported");
+              }
             }
-          }
-          return _this.tag.find(".globe").removeClass("loading");
+            return _this.tag.find(".globe").removeClass("loading");
+          });
         };
-      })(this));
+      })(this);
     };
 
     Sidebar.prototype.unloadGlobe = function() {

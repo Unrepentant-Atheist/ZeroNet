@@ -40,7 +40,8 @@ class FileRequest(object):
 
     def response(self, msg, streaming=False):
         if self.responded:
-            self.log.debug("Req id %s already responded" % self.req_id)
+            if config.verbose:
+                self.log.debug("Req id %s already responded" % self.req_id)
             return
         if not isinstance(msg, dict):  # If msg not a dict create a {"body": msg}
             msg = {"body": msg}
@@ -56,14 +57,16 @@ class FileRequest(object):
         if "site" in params and self.connection.site_lock and self.connection.site_lock not in (params["site"], "global"):
             self.response({"error": "Invalid site"})
             self.log.error("Site lock violation: %s != %s" % (self.connection.site_lock != params["site"]))
+            self.connection.badAction(5)
             return False
 
         if cmd == "update":
             event = "%s update %s %s" % (self.connection.id, params["site"], params["inner_path"])
             if not RateLimit.isAllowed(event):  # There was already an update for this file in the last 10 second
+                time.sleep(5)
                 self.response({"ok": "File update queued"})
-            # If called more than once within 10 sec only keep the last update
-            RateLimit.callAsync(event, 10, self.actionUpdate, params)
+            # If called more than once within 20 sec only keep the last update
+            RateLimit.callAsync(event, max(self.connection.bad_actions, 20), self.actionUpdate, params)
         else:
             func_name = "action" + cmd[0].upper() + cmd[1:]
             func = getattr(self, func_name, None)
@@ -80,8 +83,8 @@ class FileRequest(object):
             return False
         if site.settings["own"] and params["inner_path"].endswith("content.json"):
             self.log.debug(
-                "Someone trying to push a file to own site %s, reload local %s first" %
-                (site.address, params["inner_path"])
+                "%s pushing a file to own site %s, reloading local %s first" %
+                (self.connection.ip, site.address, params["inner_path"])
             )
             changed, deleted = site.content_manager.loadContent(params["inner_path"], add_bad_files=False)
             if changed or deleted:  # Content.json changed locally
@@ -98,14 +101,15 @@ class FileRequest(object):
             if params["inner_path"].endswith("content.json"):  # Download every changed file from peer
                 peer = site.addPeer(self.connection.ip, self.connection.port, return_peer=True)  # Add or get peer
                 # On complete publish to other peers
-                site.onComplete.once(lambda: site.publish(inner_path=params["inner_path"]), "publish_%s" % params["inner_path"])
+                site.onComplete.once(lambda: site.publish(inner_path=params["inner_path"], diffs=params.get("diffs", {})), "publish_%s" % params["inner_path"])
 
                 # Load new content file and download changed files in new thread
                 gevent.spawn(
-                    lambda: site.downloadContent(params["inner_path"], peer=peer)
+                    lambda: site.downloadContent(params["inner_path"], peer=peer, diffs=params.get("diffs", {}))
                 )
 
             self.response({"ok": "Thanks, file %s updated!" % params["inner_path"]})
+            self.connection.goodAction()
 
         elif valid is None:  # Not changed
             if params.get("peer"):
@@ -113,20 +117,24 @@ class FileRequest(object):
             else:
                 peer = site.addPeer(self.connection.ip, self.connection.port, return_peer=True)  # Add or get peer
             if peer:
-                self.log.debug(
-                    "Same version, adding new peer for locked files: %s, tasks: %s" %
-                    (peer.key, len(site.worker_manager.tasks))
-                )
+                peer.last_content_json_update = site.content_manager.contents[params["inner_path"]]["modified"]
+                if config.verbose:
+                    self.log.debug(
+                        "Same version, adding new peer for locked files: %s, tasks: %s" %
+                        (peer.key, len(site.worker_manager.tasks))
+                    )
                 for task in site.worker_manager.tasks:  # New peer add to every ongoing task
-                    if task["peers"]:
+                    if task["peers"] and not task["optional_hash_id"]:
                         # Download file from this peer too if its peer locked
                         site.needFile(task["inner_path"], peer=peer, update=True, blocking=False)
 
             self.response({"ok": "File not changed"})
+            self.connection.badAction()
 
-        else:  # Invalid sign or sha1 hash
+        else:  # Invalid sign or sha hash
             self.log.debug("Update for %s is invalid" % params["inner_path"])
             self.response({"error": "File invalid"})
+            self.connection.badAction(5)
 
     # Send file content request
     def actionGetFile(self, params):
@@ -248,10 +256,11 @@ class FileRequest(object):
 
         if added:
             site.worker_manager.onPeers()
-            self.log.debug(
-                "Added %s peers to %s using pex, sending back %s" %
-                (added, site, len(packed_peers["ip4"]) + len(packed_peers["onion"]))
-            )
+            if config.verbose:
+                self.log.debug(
+                    "Added %s peers to %s using pex, sending back %s" %
+                    (added, site, len(packed_peers["ip4"]) + len(packed_peers["onion"]))
+                )
 
         back = {}
         if packed_peers["ip4"]:
@@ -299,33 +308,46 @@ class FileRequest(object):
         site = self.sites.get(params["site"])
         if not site or not site.settings["serving"]:  # Site unknown or not serving
             self.response({"error": "Unknown site"})
+            self.connection.badAction(5)
             return False
 
         found = site.worker_manager.findOptionalHashIds(params["hash_ids"])
 
-        back = {}
+        back_ip4 = {}
+        back_onion = {}
         for hash_id, peers in found.iteritems():
-            back[hash_id] = [helper.packAddress(peer.ip, peer.port) for peer in peers]
+            back_onion[hash_id] = [helper.packOnionAddress(peer.ip, peer.port) for peer in peers if peer.ip.endswith("onion")]
+            back_ip4[hash_id] = [helper.packAddress(peer.ip, peer.port) for peer in peers if not peer.ip.endswith("onion")]
+
         # Check my hashfield
-        if config.ip_external:
-            my_ip = config.ip_external
-        else:
-            my_ip = self.server.ip
+        if self.server.tor_manager and self.server.tor_manager.site_onions.get(site.address):  # Running onion
+            my_ip = helper.packOnionAddress(self.server.tor_manager.site_onions[site.address], self.server.port)
+            my_back = back_onion
+        elif config.ip_external:  # External ip defined
+            my_ip = helper.packAddress(config.ip_external, self.server.port)
+            my_back = back_ip4
+        else:  # No external ip defined
+            my_ip = my_ip = helper.packAddress(self.server.ip, self.server.port)
+            my_back = back_ip4
+
         for hash_id in params["hash_ids"]:
             if hash_id in site.content_manager.hashfield:
-                if hash_id not in back:
-                    back[hash_id] = []
-                back[hash_id].append(helper.packAddress(my_ip, self.server.port))  # Add myself
-        self.log.debug(
-            "Found: %s/%s" %
-            (len(back), len(params["hash_ids"]))
-        )
-        self.response({"peers": back})
+                if hash_id not in my_back:
+                    my_back[hash_id] = []
+                my_back[hash_id].append(my_ip)  # Add myself
+
+        if config.verbose:
+            self.log.debug(
+                "Found: IP4: %s, Onion: %s for %s hashids" %
+                (len(back_ip4), len(back_onion), len(params["hash_ids"]))
+            )
+        self.response({"peers": back_ip4, "peers_onion": back_onion})
 
     def actionSetHashfield(self, params):
         site = self.sites.get(params["site"])
         if not site or not site.settings["serving"]:  # Site unknown or not serving
             self.response({"error": "Unknown site"})
+            self.connection.badAction(5)
             return False
 
         peer = site.addPeer(self.connection.ip, self.connection.port, return_peer=True, connection=self.connection)  # Add or get peer
@@ -350,7 +372,7 @@ class FileRequest(object):
             self.response({"error": "Only local host allowed"})
 
         site = self.sites.get(params["site"])
-        num = site.publish(inner_path=params.get("inner_path", "content.json"))
+        num = site.publish(limit=8, inner_path=params.get("inner_path", "content.json"), diffs=params.get("diffs", {}))
 
         self.response({"ok": "Successfuly published to %s peers" % num})
 
@@ -361,3 +383,4 @@ class FileRequest(object):
     # Unknown command
     def actionUnknown(self, cmd, params):
         self.response({"error": "Unknown command: %s" % cmd})
+        self.connection.badAction(5)
